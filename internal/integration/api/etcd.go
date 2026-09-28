@@ -8,12 +8,14 @@ package api
 
 import (
 	"context"
+	"net/netip"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/blang/semver/v4"
 	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/go-retry/retry"
 	"google.golang.org/grpc/codes"
 
@@ -108,6 +110,12 @@ func (suite *EtcdSuite) TestLeaveCluster() {
 
 	node := nodes[len(nodes)-1]
 
+	vipAddressID, vipHolder := suite.findVIPHolder(nodes)
+	if vipHolder != "" {
+		// leaving etcd on the VIP holder checks that the VIP moves without waiting for the election lease to expire
+		node = vipHolder
+	}
+
 	suite.T().Log("Removing etcd member", node)
 
 	nodeCtx := client.WithNode(suite.ctx, node)
@@ -117,6 +125,10 @@ func (suite *EtcdSuite) TestLeaveCluster() {
 
 	err = suite.Client.EtcdLeaveCluster(nodeCtx, &machineapi.EtcdLeaveClusterRequest{})
 	suite.Require().NoError(err)
+
+	if vipHolder != "" {
+		suite.assertVIPMoved(nodes, node, vipAddressID)
+	}
 
 	services, err := suite.Client.ServiceInfo(nodeCtx, "etcd")
 	suite.Require().NoError(err)
@@ -148,6 +160,68 @@ func (suite *EtcdSuite) TestLeaveCluster() {
 		}, 10*time.Minute,
 		suite.CleanupFailedPods,
 	)
+}
+
+// findVIPHolder returns the address ID of the Layer 2 VIP and the node which announces it, if the cluster has one.
+func (suite *EtcdSuite) findVIPHolder(nodes []string) (addressID, holder string) {
+	specs, err := safe.ReaderListAll[*network.OperatorSpec](client.WithNode(suite.ctx, nodes[0]), suite.Client.COSI)
+	suite.Require().NoError(err)
+
+	for spec := range specs.All() {
+		if spec.TypedSpec().Operator != network.OperatorVIP {
+			continue
+		}
+
+		vip := spec.TypedSpec().VIP.IP
+		addressID = network.AddressID(spec.TypedSpec().LinkName, netip.PrefixFrom(vip, vip.BitLen()))
+
+		break
+	}
+
+	if addressID == "" {
+		return "", ""
+	}
+
+	for _, node := range nodes {
+		_, err = safe.ReaderGetByID[*network.AddressStatus](client.WithNode(suite.ctx, node), suite.Client.COSI, addressID)
+		if err == nil {
+			return addressID, node
+		}
+
+		suite.Require().True(state.IsNotFoundError(err), "unexpected error reading address %q on %q: %s", addressID, node, err)
+	}
+
+	return "", ""
+}
+
+// assertVIPMoved checks that another control plane node announces the VIP after the holder left etcd.
+func (suite *EtcdSuite) assertVIPMoved(nodes []string, leftNode, addressID string) {
+	// well below the 60s election session lease, which is what the other nodes wait for if the key is left behind
+	const timeout = 20 * time.Second
+
+	suite.Require().NoError(retry.Constant(timeout, retry.WithUnits(time.Second)).RetryWithContext(
+		suite.ctx,
+		func(ctx context.Context) error {
+			for _, node := range nodes {
+				if node == leftNode {
+					continue
+				}
+
+				_, err := safe.ReaderGetByID[*network.AddressStatus](client.WithNode(ctx, node), suite.Client.COSI, addressID)
+				if err == nil {
+					suite.T().Logf("VIP %q moved to %q", addressID, node)
+
+					return nil
+				}
+
+				if !state.IsNotFoundError(err) {
+					return err
+				}
+			}
+
+			return retry.ExpectedErrorf("no control plane node announces the VIP %q yet", addressID)
+		},
+	))
 }
 
 // TestMembers verifies that etcd members as resources and API response are consistent.

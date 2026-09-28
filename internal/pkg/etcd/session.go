@@ -6,9 +6,12 @@ package etcd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/cosi-project/runtime/pkg/state"
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
@@ -20,6 +23,12 @@ import (
 // must never block indefinitely: on machine shutdown the local etcd is stopped before the
 // controller runtime is torn down, so the cleanup RPCs have no chance to ever complete.
 const CleanupTimeout = 10 * time.Second
+
+// revokeAttemptTimeout bounds a single revoke attempt in RevokeSessionThroughControlPlane.
+//
+// A proposal dropped by an etcd leader change waits for the whole etcd request timeout (5s plus
+// twice the election timeout), which can outlast CleanupTimeout, while a retry succeeds at once.
+const revokeAttemptTimeout = time.Second
 
 // RevokeSession stops refreshing the session lease and revokes it on a context detached from ctx.
 //
@@ -45,4 +54,39 @@ func (c *Client) RevokeSession(ctx context.Context, session *concurrency.Session
 	}
 
 	return nil
+}
+
+// RevokeSessionThroughControlPlane revokes the session lease through the control plane members.
+//
+// It is for the case when the local etcd member is gone (for example, after `etcd leave`), as the
+// session's own client talks to the local member only and can't reach the cluster anymore.
+func RevokeSessionThroughControlPlane(ctx context.Context, st state.State, session *concurrency.Session) error {
+	// stop refreshing the lease; this is local-only and doesn't talk to etcd
+	session.Orphan()
+
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), CleanupTimeout)
+	defer cancel()
+
+	client, err := NewClientFromControlPlaneIPs(ctx, st)
+	if err != nil {
+		return fmt.Errorf("error creating etcd client: %w", err)
+	}
+
+	defer client.Close() //nolint:errcheck
+
+	for {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, revokeAttemptTimeout)
+		_, err = client.Revoke(attemptCtx, session.Lease())
+
+		attemptCancel()
+
+		// a retried revoke which was already applied reports the lease as not found
+		if err == nil || errors.Is(err, rpctypes.ErrLeaseNotFound) {
+			return nil
+		}
+
+		if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return fmt.Errorf("error revoking etcd session lease: %w", err)
+		}
+	}
 }

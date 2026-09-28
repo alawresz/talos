@@ -228,6 +228,9 @@ func (vip *VIP) campaign(ctx context.Context, notifyCh chan<- struct{}) error {
 		return fmt.Errorf("failed to create concurrency session: %w", err)
 	}
 
+	// set when the local etcd service is destroyed, e.g. after `etcd leave` removed this member
+	var localEtcdStopped bool
+
 	defer func() {
 		// Revoke the session lease to drop this node's election key.
 		//
@@ -236,6 +239,18 @@ func (vip *VIP) campaign(ctx context.Context, notifyCh chan<- struct{}) error {
 		// is aborted, so that attempt always fails. The etcd election is a FIFO queue ordered by
 		// create revision, so a key left behind by a node which is no longer campaigning delays
 		// the failover for every node queued behind it until the lease expires (60s).
+		if localEtcdStopped {
+			if err := etcd.RevokeSessionThroughControlPlane(ctx, vip.state, sess); err != nil {
+				vip.logger.Info("failed revoking etcd session through control plane members", zap.String("link", vip.linkName), zap.Stringer("ip", vip.sharedIP), zap.Error(err))
+
+				return
+			}
+
+			vip.logger.Info("revoked etcd session through control plane members", zap.String("link", vip.linkName), zap.Stringer("ip", vip.sharedIP))
+
+			return
+		}
+
 		if err := ec.RevokeSession(ctx, sess); err != nil {
 			// etcd is expected to be unreachable when the machine is shutting down
 			vip.logger.Debug("failed revoking etcd session", zap.Error(err))
@@ -305,6 +320,8 @@ campaignLoop:
 			// note: here we don't wait for kube-apiserver, as it might not be up on cluster bootstrap, but VIP should be still assigned
 			// break the loop when etcd is stopped
 			if event.Type == state.Destroyed && event.Resource.Metadata().ID() == "etcd" {
+				localEtcdStopped = true
+
 				return nil
 			}
 
@@ -318,6 +335,11 @@ campaignLoop:
 	}
 
 	defer func() {
+		if localEtcdStopped {
+			// the local client can't reach etcd anymore; the deferred session revoke drops the election key
+			return
+		}
+
 		// use a new context to resign, as `ctx` might be canceled
 		resignCtx, resignCancel := context.WithTimeout(context.WithoutCancel(ctx), etcd.CleanupTimeout)
 		defer resignCancel()
@@ -363,7 +385,13 @@ observeLoop:
 		case event := <-watchCh:
 			// break the loop when etcd is stopped or kube-apiserver is stopped
 			if event.Type == state.Destroyed {
-				if event.Resource.Metadata().ID() == "etcd" || strings.HasPrefix(event.Resource.Metadata().ID(), "kube-system/kube-apiserver-") {
+				if event.Resource.Metadata().ID() == "etcd" {
+					localEtcdStopped = true
+
+					break observeLoop
+				}
+
+				if strings.HasPrefix(event.Resource.Metadata().ID(), "kube-system/kube-apiserver-") {
 					break observeLoop
 				}
 			}
